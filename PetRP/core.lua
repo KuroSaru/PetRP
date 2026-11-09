@@ -1,26 +1,72 @@
-﻿PetRP = PetRP or {}
+local NO_PET_ICON = "Interface\\PVPFrame\\Icons\\PVP-Banner-Emblem-40"
+
+PetRP = PetRP or {}
+PetRP.NO_PET_ICON = NO_PET_ICON
 PetRP.state = {
     petID = nil,
     petName = nil,
     rpName = nil,
-    icon = "ability_hunter_beastcall",
+    petTitle = "",
+    petBody = "",
+    petColorHex = "ffd100",
+    hasProfile = false,
+    loadedPoolPetKey = nil,
+    icon = NO_PET_ICON,
     persona = "",
     stopped = false,
     periodicCycle = math.random(1, 3), -- 1 = Emote, 2 = Say, 3 = Musician/Sound
     ticker = nil,
     probeTicker = nil,
+    nextTickTime = nil,
+    pausedRemaining = nil,
     hasPendingSmuggle = false,
     pendingSyncCount = 0,
+    lastReactMsg = nil,
     lastEmoteMsg = nil,
     lastSayMsg = nil,
+    previewReact = nil,
     previewEmote = nil,
     previewSay = nil,
+    lastSoundSig = nil,
 }
 
 local state = PetRP.state
 local SIGNAL_SYNC_PREFIX = "Interface\\AddOns\\PetRP\\sync"
 
--- 60 Built-in Companion Defaults (30 Physical Emotes + 30 Vocalizations/Messages)
+-- 90 Built-in Companion Defaults (30 Reactive Emotes + 30 Periodic Emotes + 30 Periodic Vocalizations/Says)
+local BUILTIN_DEFAULT_REACTIVE = {
+    "perks up immediately at the mention of its name, tilting its head with bright, attentive eyes.",
+    "turns its gaze sharply toward the speaker, wiggling in recognition.",
+    "bounds a step closer when spoken to, radiating eager curiosity.",
+    "swivels its attention toward the voice and gives an affectionate little nod.",
+    "looks back and forth between the speaker and its master as if following every word.",
+    "bounces on its heels with unmistakable delight at being noticed.",
+    "sidles right up to its master's side, puffing up protectively at the mention of their name.",
+    "cocks its head inquisitively at the speaker, waiting to see what happens next.",
+    "gives an enthusiastic little hop to acknowledge that it is listening closely.",
+    "fixes an unblinking, expressive gaze upon whoever just spoke.",
+    "nudges its master's leg in quiet solidarity after hearing their name.",
+    "fluffs up with sudden pride upon hearing itself mentioned in conversation.",
+    "trots a small half-circle in place, clearly pleased to be included.",
+    "leans forward attentively, ears and eyes locked onto the speaker.",
+    "lets out a soft, reactive little huff and shifts into an alert stance.",
+    "blinks twice at the speaker before offering a cheerful little bob of its head.",
+    "watches the speaker with narrows eyes full of playful mischief.",
+    "steps out slightly in front of its master, acting like a tiny bodyguard.",
+    "tilts its head from left to right, thoroughly intrigued by the remark.",
+    "gives a quick, theatrical spin in response to hearing its name called.",
+    "peers up at its master for approval before looking back at the speaker.",
+    "patters its feet rapidly on the ground, excited by the sudden attention.",
+    "draws itself up to its full miniature height as if answering roll call.",
+    "sways happily in place, delighted to be part of the discussion.",
+    "glances sharply toward the speaker, tracking every gesture with keen interest.",
+    "presses affectionately against its master's shin as the conversation turns their way.",
+    "offers a spirited little salute of a hop when addressed.",
+    "watches the speaker with wide, gleaming eyes full of anticipation.",
+    "pivots smoothly toward the voice, poised and ready for action.",
+    "beams with pint-sized importance the moment its name echoes nearby."
+}
+
 local BUILTIN_DEFAULT_EMOTES = {
     "tilts its head curiously and watches everyone nearby.",
     "perks up suddenly, scanning the area with bright eyes.",
@@ -87,19 +133,98 @@ local BUILTIN_DEFAULT_SAYS = {
     "*croons a gentle, reassuring note from beside its master.*"
 }
 
-local function EnsurePoolsInitialized()
-    _G.PetRP_ReactivePool = type(_G.PetRP_ReactivePool) == "table" and _G.PetRP_ReactivePool or {}
-    _G.PetRP_EmotePool = type(_G.PetRP_EmotePool) == "table" and _G.PetRP_EmotePool or {}
-    _G.PetRP_SayPool = type(_G.PetRP_SayPool) == "table" and _G.PetRP_SayPool or {}
+local function CopyList(src)
+    local out = {}
+    if type(src) == "table" then
+        for i, v in ipairs(src) do out[i] = v end
+    end
+    return out
+end
 
-    if type(_G.PetRP_DefaultEmotes) ~= "table" or #_G.PetRP_DefaultEmotes == 0 then
-        _G.PetRP_DefaultEmotes = {}
-        for i, v in ipairs(BUILTIN_DEFAULT_EMOTES) do _G.PetRP_DefaultEmotes[i] = v end
+local function UnloadAllPools()
+    _G.PetRP_ReactivePool = {}
+    _G.PetRP_EmotePool = {}
+    _G.PetRP_SayPool = {}
+    _G.PetRP_DefaultReactive = {}
+    _G.PetRP_DefaultEmotes = {}
+    _G.PetRP_DefaultSays = {}
+    state.loadedPoolPetKey = nil
+    state.lastReactMsg = nil
+    state.lastEmoteMsg = nil
+    state.lastSayMsg = nil
+    state.previewReact = nil
+    state.previewEmote = nil
+    state.previewSay = nil
+end
+
+local function FindPetPoolEntry(petName, rpName)
+    if type(_G.PetRP_PetPools) ~= "table" then return nil end
+    local candidates = {}
+    if rpName and rpName ~= "" then
+        candidates[#candidates + 1] = rpName
+        candidates[#candidates + 1] = rpName:lower()
     end
-    if type(_G.PetRP_DefaultSays) ~= "table" or #_G.PetRP_DefaultSays == 0 then
-        _G.PetRP_DefaultSays = {}
-        for i, v in ipairs(BUILTIN_DEFAULT_SAYS) do _G.PetRP_DefaultSays[i] = v end
+    if petName and petName ~= "" then
+        candidates[#candidates + 1] = petName
+        candidates[#candidates + 1] = petName:lower()
     end
+    for _, key in ipairs(candidates) do
+        if type(_G.PetRP_PetPools[key]) == "table" then
+            return _G.PetRP_PetPools[key]
+        end
+    end
+    for k, v in pairs(_G.PetRP_PetPools) do
+        if type(k) == "string" and type(v) == "table" then
+            local kl = k:lower()
+            if (rpName and kl == rpName:lower()) or (petName and kl == petName:lower()) then
+                return v
+            end
+        end
+    end
+    return nil
+end
+
+local function SyncActivePetPools()
+    if not state.petName or not state.hasProfile then
+        UnloadAllPools()
+        return
+    end
+    local petKey = ((state.rpName or state.petName) or ""):lower()
+    if state.loadedPoolPetKey == petKey and type(_G.PetRP_DefaultEmotes) == "table" and #_G.PetRP_DefaultEmotes > 0 then
+        return
+    end
+
+    local entry = FindPetPoolEntry(state.petName, state.rpName)
+    if entry then
+        _G.PetRP_ReactivePool = CopyList(entry.reactive)
+        _G.PetRP_EmotePool = CopyList(entry.emotes)
+        _G.PetRP_SayPool = CopyList(entry.says)
+        _G.PetRP_DefaultReactive = (type(entry.defReactive) == "table" and #entry.defReactive > 0) and CopyList(entry.defReactive) or CopyList(BUILTIN_DEFAULT_REACTIVE)
+        _G.PetRP_DefaultEmotes = (type(entry.defEmotes) == "table" and #entry.defEmotes > 0) and CopyList(entry.defEmotes) or CopyList(BUILTIN_DEFAULT_EMOTES)
+        _G.PetRP_DefaultSays = (type(entry.defSays) == "table" and #entry.defSays > 0) and CopyList(entry.defSays) or CopyList(BUILTIN_DEFAULT_SAYS)
+    else
+        _G.PetRP_ReactivePool = {}
+        _G.PetRP_EmotePool = {}
+        _G.PetRP_SayPool = {}
+        _G.PetRP_DefaultReactive = CopyList(BUILTIN_DEFAULT_REACTIVE)
+        _G.PetRP_DefaultEmotes = CopyList(BUILTIN_DEFAULT_EMOTES)
+        _G.PetRP_DefaultSays = CopyList(BUILTIN_DEFAULT_SAYS)
+    end
+    state.loadedPoolPetKey = petKey
+    state.lastReactMsg = nil
+    state.lastEmoteMsg = nil
+    state.lastSayMsg = nil
+    state.previewReact = nil
+    state.previewEmote = nil
+    state.previewSay = nil
+end
+
+local function EnsurePoolsInitialized()
+    if not state.petName or not state.hasProfile then
+        UnloadAllPools()
+        return
+    end
+    SyncActivePetPools()
 end
 
 local function BuildCombinedList(customPool, defaultPool)
@@ -146,7 +271,6 @@ local function PickRandomFromCombined(customPool, defaultPool, lastMsgKey, previ
 
     state[lastMsgKey] = chosen
 
-    -- Roll next random preview so tooltip shows an upcoming random candidate
     local nextIdx = math.random(1, count)
     if combined[nextIdx] == chosen then
         nextIdx = (nextIdx % count) + 1
@@ -159,11 +283,18 @@ end
 
 function PetRP.GetPoolCounts()
     EnsurePoolsInitialized()
-    return #_G.PetRP_ReactivePool, #_G.PetRP_EmotePool, #_G.PetRP_SayPool, #_G.PetRP_DefaultEmotes, #_G.PetRP_DefaultSays
+    return #_G.PetRP_ReactivePool, #_G.PetRP_EmotePool, #_G.PetRP_SayPool, #_G.PetRP_DefaultEmotes, #_G.PetRP_DefaultSays, #(_G.PetRP_DefaultReactive or {})
 end
 
 function PetRP.PeekNextMessages()
     EnsurePoolsInitialized()
+    if not state.petName or not state.hasProfile then
+        return "", "", ""
+    end
+    if not state.previewReact then
+        local reacts = BuildCombinedList(_G.PetRP_ReactivePool, _G.PetRP_DefaultReactive)
+        if #reacts > 0 then state.previewReact = reacts[math.random(1, #reacts)] end
+    end
     if not state.previewEmote then
         local emotes = BuildCombinedList(_G.PetRP_EmotePool, _G.PetRP_DefaultEmotes)
         if #emotes > 0 then state.previewEmote = emotes[math.random(1, #emotes)] end
@@ -172,8 +303,35 @@ function PetRP.PeekNextMessages()
         local says = BuildCombinedList(_G.PetRP_SayPool, _G.PetRP_DefaultSays)
         if #says > 0 then state.previewSay = says[math.random(1, #says)] end
     end
-    local nextReact = _G.PetRP_ReactivePool[1] or state.previewEmote or ""
-    return nextReact, state.previewEmote or "", state.previewSay or ""
+    return state.previewReact or "", state.previewEmote or "", state.previewSay or ""
+end
+
+function PetRP.ComputePetBeaconByte(nameStr)
+    if not nameStr or nameStr == "" then return 0 end
+    local s = nameStr:lower()
+    local sum = 0
+    for i = 1, #s do
+        sum = (sum * 31 + s:byte(i)) % 231
+    end
+    return 20 + sum
+end
+
+function PetRP.OpenTRP3CompanionsDialog()
+    if TRP3_API and TRP3_API.navigation then
+        if TRP3_API.navigation.openMainFrame then
+            pcall(TRP3_API.navigation.openMainFrame)
+        end
+        if TRP3_API.navigation.menu and TRP3_API.navigation.menu.selectMenu then
+            local ok = pcall(TRP3_API.navigation.menu.selectMenu, "main_20_companions_20_profiles")
+            if not ok then
+                pcall(TRP3_API.navigation.menu.selectMenu, "main_20_companions")
+            end
+        end
+        return
+    end
+    if SlashCmdList and SlashCmdList["TOTALRP3"] then
+        pcall(SlashCmdList["TOTALRP3"], "")
+    end
 end
 
 -- Sequence-numbered signal probe: checks ONLY sync<PetRP_SyncSeq + 1>.mp3 (created on disk only when an update is pending)
@@ -202,43 +360,124 @@ local function InitConfig()
     PetRP_Config.interval = PetRP_Config.interval or 180
     PetRP_Config.scale = PetRP_Config.scale or 1.0
     PetRP_Config.pos = PetRP_Config.pos or { point = "CENTER", x = 0, y = -140 }
-    EnsurePoolsInitialized()
+    PetRP_Config.seenPets = PetRP_Config.seenPets or {}
+    PetRP_Config.petSettings = PetRP_Config.petSettings or {}
+end
+
+function PetRP.GetPetSettings(petName, rpName)
+    InitConfig()
+    local pName = petName or state.petName
+    local rName = rpName or state.rpName
+    local pKey = pName and pName ~= "" and pName:lower() or nil
+    local rKey = rName and rName ~= "" and rName:lower() or nil
+    if not pKey and not rKey then
+        return {
+            interval = math.max(15, tonumber(PetRP_Config.interval) or 180),
+            autoStart = true,
+            speakOnLoad = false,
+        }
+    end
+
+    local settings = (rKey and PetRP_Config.petSettings[rKey]) or (pKey and PetRP_Config.petSettings[pKey])
+    if type(settings) ~= "table" then
+        settings = {
+            interval = math.max(15, tonumber(PetRP_Config.interval) or 180),
+            autoStart = true,
+            speakOnLoad = false,
+        }
+    else
+        settings.interval = math.max(15, tonumber(settings.interval) or tonumber(PetRP_Config.interval) or 180)
+        if settings.autoStart == nil then settings.autoStart = true end
+        if settings.speakOnLoad == nil then settings.speakOnLoad = false end
+    end
+
+    if pKey then PetRP_Config.petSettings[pKey] = settings end
+    if rKey then PetRP_Config.petSettings[rKey] = settings end
+    return settings
+end
+
+function PetRP.GetActiveInterval()
+    local cfg = PetRP.GetPetSettings()
+    return math.max(15, tonumber(cfg and cfg.interval) or tonumber(PetRP_Config and PetRP_Config.interval) or 180)
+end
+
+function PetRP.GetPetColorRGB()
+    local hex = (state.hasProfile and type(state.petColorHex) == "string" and state.petColorHex:match("^%x%x%x%x%x%x$"))
+        and state.petColorHex:lower() or "ffd100"
+    local r = tonumber(hex:sub(1, 2), 16) / 255
+    local g = tonumber(hex:sub(3, 4), 16) / 255
+    local b = tonumber(hex:sub(5, 6), 16) / 255
+    return r, g, b, hex
+end
+
+function PetRP.GetRemainingPeriodicSeconds()
+    local interval = PetRP.GetActiveInterval()
+    if state.stopped then
+        return 0, "Stopped"
+    elseif PetRP_Config and PetRP_Config.paused then
+        return math.max(1, tonumber(state.remainingSeconds) or interval), "Paused"
+    end
+    local rem = math.ceil(tonumber(state.remainingSeconds) or interval)
+    if rem < 0 or rem > interval then rem = interval end
+    return rem, "Active"
 end
 
 local function CleanText(str)
     if not str then return "" end
-    return str:gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", ""):gsub("%s+", " "):sub(1, 300)
+    return str:gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", ""):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", ""):sub(1, 300)
 end
 
-local function ExtractGlances(pe)
-    if not pe then return "" end
-    local traits = {}
-    for i = 1, 5 do
-        local slot = pe[tostring(i)]
-        if slot and slot.AC and slot.TI then
-            traits[#traits + 1] = slot.TI .. (slot.TX and (": " .. slot.TX) or "")
-        end
-    end
-    return table.concat(traits, "; ")
+local function CleanBodyText(str)
+    if not str then return "" end
+    return str
+        :gsub("%{img:[^}]+%}", "")
+        :gsub("%{icon:[^}]+%}", "")
+        :gsub("%{link%*[^}]+%}", "")
+        :gsub("%{/?h%d?[^}]*%}", "")
+        :gsub("%{/?p[^}]*%}", "")
+        :gsub("%{col:[^}]+%}", "")
+        :gsub("%{/col%}", "")
+        :gsub("|c%x%x%x%x%x%x%x%x", "")
+        :gsub("|r", "")
+        :gsub("%s+", " ")
+        :gsub("^%s+", "")
+        :gsub("%s+$", "")
+        :sub(1, 350)
 end
 
 local function GetTRP3Persona(lookupName)
-    if not (TRP3_API and TRP3_API.companions and TRP3_API.companions.player) then return lookupName, "", nil end
-    local profile = TRP3_API.companions.player.getCompanionProfile(lookupName)
-    if not (profile and profile.data) then return lookupName, "", nil end
+    if not lookupName or lookupName == "" then return nil, "", "", "ffd100", nil, false end
+    local profile = nil
+    if TRP3_API and TRP3_API.companions and TRP3_API.companions.player and TRP3_API.companions.player.getCompanionProfile then
+        profile = TRP3_API.companions.player.getCompanionProfile(lookupName)
+    end
+    if not (profile and profile.data) and TRP3_Companions and TRP3_Companions.player then
+        for _, prof in pairs(TRP3_Companions.player) do
+            if prof and prof.links and prof.links[lookupName] and prof.data then
+                profile = prof
+                break
+            end
+        end
+    end
+    if not (profile and profile.data) then
+        return nil, "", "", "ffd100", nil, false
+    end
+
     local d = profile.data
-    local rpName = d.NA or lookupName
+    local rpName = (d.NA and d.NA ~= "" and d.NA) or lookupName
+    local title = CleanText(d.TI)
+    local body = CleanBodyText(d.TX)
+    local colorHex = (type(d.NH) == "string" and d.NH:match("^%x%x%x%x%x%x$")) and d.NH:lower() or "ffd100"
     local iconInfo = TRP3_IconUtil and TRP3_IconUtil.GetIconInfo and TRP3_IconUtil.GetIconInfo(d.IC)
     local iconName = (TRP3_IconUtil and TRP3_IconUtil.GetIconName and TRP3_IconUtil.GetIconName(d.IC))
         or (iconInfo and (iconInfo.file or iconInfo.atlas)) or d.IC
     if PetRP_Config and iconName then
         PetRP_Config.iconNames = PetRP_Config.iconNames or {}
         PetRP_Config.iconNames[lookupName] = tostring(iconName):lower()
+        if rpName then PetRP_Config.iconNames[rpName] = tostring(iconName):lower() end
         if d.IC then PetRP_Config.iconNames[tostring(d.IC)] = tostring(iconName):lower() end
     end
-    local details = string.format("Name: %s | Title: %s | At First Glance: %s | About: %s",
-        rpName, CleanText(d.TI), CleanText(ExtractGlances(profile.PE)), CleanText(d.TX))
-    return rpName, details, d.IC
+    return rpName, title, body, colorHex, d.IC, true
 end
 
 local function ResolveSummonedCompanion()
@@ -256,7 +495,7 @@ local function ResolveSummonedCompanion()
     end
     local unitPet = UnitExists("pet") and UnitNameUnmodified("pet")
     if unitPet and unitPet ~= UNKNOWNOBJECT then
-        return "pet:" .. unitPet, unitPet, GetPetIcon and GetPetIcon() or "ability_hunter_beastcall"
+        return "pet:" .. unitPet, unitPet, GetPetIcon and GetPetIcon() or NO_PET_ICON
     end
     return nil, nil, nil
 end
@@ -286,9 +525,36 @@ function PetRP.PlayCompanionSound()
     end
 end
 
+local function FormatIconMarkup(iconVal)
+    if not iconVal or iconVal == "" then return "" end
+    local texPath = iconVal
+    if type(iconVal) == "string" and not iconVal:find("\\") and not tonumber(iconVal) then
+        texPath = "Interface\\Icons\\" .. iconVal
+    end
+    return string.format("|T%s:16:16:0:0:64:64:4:60:4:60|t ", tostring(texPath))
+end
+
+local function RenderLocalCompanionFallback(speaker, bodyText, isSpokenSay)
+    if not DEFAULT_CHAT_FRAME or not DEFAULT_CHAT_FRAME.AddMessage then return end
+    local _, _, _, pHex = PetRP.GetPetColorRGB()
+    local iconTag = FormatIconMarkup(state.icon)
+    local info = ChatTypeInfo and ChatTypeInfo["EMOTE"]
+    local r = (info and info.r) or 1.0
+    local g = (info and info.g) or 0.5
+    local b = (info and info.b) or 0.25
+    local formatted
+    if isSpokenSay then
+        formatted = string.format('%s|cff%s%s|r says, "%s"', iconTag, pHex or "ffd100", speaker, bodyText)
+    else
+        formatted = string.format("%s|cff%s%s|r %s", iconTag, pHex or "ffd100", speaker, bodyText)
+    end
+    DEFAULT_CHAT_FRAME:AddMessage(formatted, r, g, b)
+end
+
 function PetRP.DeliverCompanionChat(msg, force, mode)
     if not msg or msg == "" then return false end
-    if not force and (state.stopped or not state.petName) then return false end
+    if not state.petName or not state.hasProfile then return false end
+    if not force and state.stopped then return false end
     local speaker = state.rpName or state.petName or "Companion"
     local cleanMsg = msg:gsub("^||%s*", ""):gsub("^|%s*", ""):gsub('^"', ''):gsub('"$', '')
     local prefix = (TRP3_API and TRP3_API.configuration and TRP3_API.configuration.getValue
@@ -298,26 +564,41 @@ function PetRP.DeliverCompanionChat(msg, force, mode)
         cleanMsg = cleanMsg:sub(#speaker + 2):gsub("^%s+", "")
     end
 
+    local chatLine
+    local fallbackBody = cleanMsg
+    local isSpokenSay = false
+
     if mode == "SAY" then
         if cleanMsg:match("^%*.*%*$") then
             local act = cleanMsg:gsub("^%*", ""):gsub("%*$", ""):gsub("^%s+", ""):gsub("%s+$", "")
             if speaker ~= "" and act:lower():sub(1, #speaker + 1) == (speaker:lower() .. " ") then
                 act = act:sub(#speaker + 2):gsub("^%s+", "")
             end
-            SendChatMessage(string.format("%s[%s] %s", prefix, speaker, act), "EMOTE")
+            fallbackBody = act
+            chatLine = string.format("%s[%s] %s", prefix, speaker, act)
         else
-            SendChatMessage(string.format('%s[%s] says, "%s"', prefix, speaker, cleanMsg), "EMOTE")
+            isSpokenSay = true
+            chatLine = string.format('%s[%s] says, "%s"', prefix, speaker, cleanMsg)
         end
     elseif mode == "SOUND" then
         PetRP.PlayCompanionSound()
-        SendChatMessage(string.format("%s[%s] %s", prefix, speaker, cleanMsg), "EMOTE")
+        chatLine = string.format("%s[%s] %s", prefix, speaker, cleanMsg)
     else
-        SendChatMessage(string.format("%s[%s] %s", prefix, speaker, cleanMsg), "EMOTE")
+        chatLine = string.format("%s[%s] %s", prefix, speaker, cleanMsg)
     end
+
+    local sendAt = GetTime and GetTime() or 0
+    pcall(SendChatMessage, chatLine, "EMOTE")
+    C_Timer.After(0.35, function()
+        if (state.lastEmoteEchoTime or 0) < sendAt then
+            RenderLocalCompanionFallback(speaker, fallbackBody, isSpokenSay)
+        end
+    end)
     return true
 end
 
 local function CycleNextPeriodic(force)
+    if not state.petName or not state.hasProfile then return false end
     EnsurePoolsInitialized()
     local order = { state.periodicCycle, (state.periodicCycle % 3) + 1, ((state.periodicCycle + 1) % 3) + 1 }
     for _, step in ipairs(order) do
@@ -346,6 +627,11 @@ end
 
 function PetRP.Speak()
     PetRP.SyncCompanionState()
+    if not state.petName then return end
+    if not state.hasProfile then
+        PetRP.OpenTRP3CompanionsDialog()
+        return
+    end
     EnsurePoolsInitialized()
     if #_G.PetRP_ReactivePool > 0 then
         local idx = math.random(1, #_G.PetRP_ReactivePool)
@@ -356,7 +642,6 @@ function PetRP.Speak()
         end
     end
 
-    -- Randomly choose between Emote (1) and Say (2) when clicking the pet icon
     local pickSay = (math.random(1, 2) == 2)
     local delivered = false
     if pickSay then
@@ -377,33 +662,86 @@ function PetRP.Speak()
     if PetRP.UpdateUI then PetRP.UpdateUI() end
 end
 
-local function OnPeriodicTick()
-    if state.stopped or PetRP_Config.paused or not state.petName then return end
-    CycleNextPeriodic(false)
-    if PetRP.UpdateUI then PetRP.UpdateUI() end
+local function OnHeartbeatTick()
+    if state.stopped or (PetRP_Config and PetRP_Config.paused) or not state.petName or not state.hasProfile then
+        return
+    end
+    local interval = PetRP.GetActiveInterval()
+    local rem = (tonumber(state.remainingSeconds) or interval) - 1
+    if rem <= 0 then
+        state.remainingSeconds = interval
+        CycleNextPeriodic(false)
+        if PetRP.UpdateUI then PetRP.UpdateUI() end
+    else
+        state.remainingSeconds = rem
+    end
 end
 
-function PetRP.RestartTicker()
+function PetRP.RestartTicker(keepRemaining)
+    local interval = PetRP.GetActiveInterval()
+    if not keepRemaining or not state.remainingSeconds or state.remainingSeconds <= 0 or state.remainingSeconds > interval then
+        state.remainingSeconds = interval
+    end
     if state.ticker then state.ticker:Cancel() end
-    state.ticker = C_Timer.NewTicker(PetRP_Config.interval, OnPeriodicTick)
+    state.ticker = C_Timer.NewTicker(1.0, OnHeartbeatTick)
     if not state.probeTicker then
         state.probeTicker = C_Timer.NewTicker(5, PetRP.ProbeSignalFile)
     end
     if PetRP.UpdateUI then PetRP.UpdateUI() end
 end
 
+local function GetMasterNames()
+    local names = {}
+    local seen = {}
+    local function addName(n)
+        if type(n) == "string" then
+            local clean = n:gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", ""):gsub("^%s+", ""):gsub("%s+$", "")
+            if #clean >= 2 then
+                local low = clean:lower()
+                if not seen[low] then
+                    seen[low] = true
+                    names[#names + 1] = low
+                end
+            end
+        end
+    end
+
+    if UnitName then addName(UnitName("player")) end
+    if UnitNameUnmodified then addName(UnitNameUnmodified("player")) end
+    if TRP3_API and TRP3_API.profile and TRP3_API.profile.getData then
+        local ok, chars = pcall(TRP3_API.profile.getData, "player/characteristics")
+        if ok and type(chars) == "table" then
+            addName(chars.FN)
+            if chars.FN and chars.LN and chars.LN ~= "" then
+                addName(chars.FN .. " " .. chars.LN)
+            end
+        end
+    end
+    if PetRP_Config then
+        PetRP_Config.masterNames = names
+    end
+    return names
+end
+
 function PetRP.SyncCompanionState()
+    GetMasterNames()
     local id, name, icon = ResolveSummonedCompanion()
     state.petID, state.petName = id, name
     if TRP3_Companions and TRP3_Companions.player and PetRP_Config then
         PetRP_Config.iconNames = PetRP_Config.iconNames or {}
+        PetRP_Config.seenPets = PetRP_Config.seenPets or {}
         for _, prof in pairs(TRP3_Companions.player) do
-            if prof and prof.data and prof.data.IC then
+            if prof and prof.data then
                 local ic = prof.data.IC
-                local resolved = (TRP3_IconUtil and TRP3_IconUtil.GetIconName and TRP3_IconUtil.GetIconName(ic)) or ic
-                PetRP_Config.iconNames[tostring(ic)] = tostring(resolved):lower()
+                local resolved = ic and ((TRP3_IconUtil and TRP3_IconUtil.GetIconName and TRP3_IconUtil.GetIconName(ic)) or ic) or nil
+                if ic and resolved then
+                    PetRP_Config.iconNames[tostring(ic)] = tostring(resolved):lower()
+                end
                 for linkName, _ in pairs(prof.links or {}) do
-                    PetRP_Config.iconNames[linkName] = tostring(resolved):lower()
+                    if resolved then
+                        PetRP_Config.iconNames[linkName] = tostring(resolved):lower()
+                    end
+                    PetRP_Config.seenPets[linkName] = prof.data.NA or linkName
                 end
             end
             if prof and prof.PE then
@@ -417,52 +755,129 @@ function PetRP.SyncCompanionState()
             end
         end
     end
+
     if not name then
-        state.rpName, state.persona, state.icon = nil, "", "ability_hunter_beastcall"
+        state.rpName, state.petTitle, state.petBody, state.petColorHex = nil, "", "", "ffd100"
+        state.persona, state.hasProfile, state.icon = "", false, NO_PET_ICON
+        state.lastActivePetKey = nil
+        UnloadAllPools()
     else
-        local rpName, persona, trpIcon = GetTRP3Persona(name)
-        state.rpName, state.persona = rpName, persona
-        state.icon = trpIcon or icon or "ability_hunter_beastcall"
+        if PetRP_Config then
+            PetRP_Config.seenPets = PetRP_Config.seenPets or {}
+            if icon then
+                PetRP_Config.iconNames = PetRP_Config.iconNames or {}
+                local rIcon = (TRP3_IconUtil and TRP3_IconUtil.GetIconName and TRP3_IconUtil.GetIconName(icon)) or icon
+                PetRP_Config.iconNames[name] = tostring(rIcon):lower()
+            end
+        end
+        local rpName, title, body, colorHex, trpIcon, hasProfile = GetTRP3Persona(name)
+        state.hasProfile = (hasProfile == true)
+        state.rpName = hasProfile and rpName or nil
+        state.petTitle = hasProfile and (title or "") or ""
+        state.petBody = hasProfile and (body or "") or ""
+        state.petColorHex = hasProfile and (colorHex or "ffd100") or "ffd100"
+        state.persona = hasProfile and (body or "") or ""
+        state.icon = (hasProfile and trpIcon) or icon or NO_PET_ICON
+        if PetRP_Config and PetRP_Config.seenPets then
+            PetRP_Config.seenPets[name] = state.rpName or name
+        end
+        if state.hasProfile then
+            SyncActivePetPools()
+            local petKey = ((state.rpName or state.petName) or ""):lower()
+            local cfg = PetRP.GetPetSettings(state.petName, state.rpName)
+            if state.lastActivePetKey ~= petKey then
+                state.lastActivePetKey = petKey
+                if cfg.autoStart then
+                    state.stopped = false
+                    PetRP_Config.paused = false
+                else
+                    state.stopped = true
+                    PetRP_Config.paused = true
+                end
+                PetRP.RestartTicker()
+                if cfg.speakOnLoad then
+                    C_Timer.After(0.8, function()
+                        if state.petName and state.hasProfile and (((state.rpName or state.petName) or ""):lower() == petKey) then
+                            PetRP.Speak()
+                        end
+                    end)
+                end
+            end
+        else
+            state.lastActivePetKey = nil
+            UnloadAllPools()
+        end
     end
     PetRP.ProbeSignalFile()
+    if PetRP.UpdateStateBeacon then PetRP.UpdateStateBeacon() end
     if PetRP.UpdateUI then PetRP.UpdateUI() end
 end
 
 function PetRP.TogglePlayPause()
+    if not state.petName or not state.hasProfile then return end
+    local interval = PetRP.GetActiveInterval()
     if state.stopped then
         state.stopped = false
         PetRP_Config.paused = false
+        state.remainingSeconds = interval
+        PetRP.RestartTicker(false)
+    elseif PetRP_Config.paused then
+        PetRP_Config.paused = false
+        if not state.remainingSeconds or state.remainingSeconds <= 0 then
+            state.remainingSeconds = interval
+        end
+        PetRP.RestartTicker(true)
     else
-        PetRP_Config.paused = not PetRP_Config.paused
+        PetRP_Config.paused = true
     end
     if PetRP.UpdateUI then PetRP.UpdateUI() end
 end
 
 function PetRP.Stop()
+    if not state.petName or not state.hasProfile or state.stopped then return end
     state.stopped = true
     PetRP_Config.paused = true
+    state.remainingSeconds = PetRP.GetActiveInterval()
     if PetRP.UpdateUI then PetRP.UpdateUI() end
 end
 
-local function IsPetMentioned(msg)
-    if state.stopped or not state.petName then return false end
+local function IsReactiveTrigger(event, msg)
+    if state.stopped or not state.petName or not state.hasProfile then return false end
+    if type(msg) ~= "string" or msg == "" then return false end
+    -- Ignore companion lines generated by PetRP/TRP3 so the pet never triggers itself
+    if msg:match("^%s*||%s*%[") or msg:match("^%s*|%s*%[") then return false end
+
     local lower = msg:lower()
     if lower:find(state.petName:lower(), 1, true) then return true end
-    return state.rpName ~= nil and lower:find(state.rpName:lower(), 1, true) ~= nil
+    if state.rpName ~= nil and lower:find(state.rpName:lower(), 1, true) then return true end
+
+    -- Also trigger when the pet's master (player) name is said in local (/say) or mentioned by an NPC/monster
+    if event == "CHAT_MSG_SAY" or (type(event) == "string" and event:find("^CHAT_MSG_MONSTER_")) then
+        for _, mName in ipairs(GetMasterNames()) do
+            if lower:find(mName, 1, true) then
+                return true
+            end
+        end
+    end
+    return false
 end
 
 local function OnEvent(_, event, arg1)
     if event == "ADDON_LOADED" and arg1 == "PetRP" then
         InitConfig()
         if PetRP.InitUI then PetRP.InitUI() end
-        PetRP.RestartTicker()
+        PetRP.RestartTicker(false)
         C_Timer.After(1.0, PetRP.SyncCompanionState)
     elseif event == "PLAYER_ENTERING_WORLD" then
         if LoggingChat then pcall(LoggingChat, true) end
         if PetRP.FlashReloadBeacon then PetRP.FlashReloadBeacon() end
         C_Timer.After(0.5, PetRP.SyncCompanionState)
     elseif event:find("^CHAT_MSG_") then
-        if IsPetMentioned(arg1) then
+        if event == "CHAT_MSG_EMOTE" and type(arg1) == "string" and (arg1:match("^%s*||%s*%[") or arg1:match("^%s*|%s*%[")) then
+            state.lastEmoteEchoTime = GetTime and GetTime() or 0
+        end
+        if IsReactiveTrigger(event, arg1) then
+            EnsurePoolsInitialized()
             local reactMsg
             if #_G.PetRP_ReactivePool > 0 then
                 local idx = math.random(1, #_G.PetRP_ReactivePool)
@@ -486,6 +901,8 @@ for _, ev in ipairs({
     "CHAT_MSG_SAY", "CHAT_MSG_EMOTE", "CHAT_MSG_TEXT_EMOTE", "CHAT_MSG_YELL",
     "CHAT_MSG_PARTY", "CHAT_MSG_PARTY_LEADER",
     "CHAT_MSG_RAID", "CHAT_MSG_RAID_LEADER", "CHAT_MSG_RAID_WARNING",
+    "CHAT_MSG_MONSTER_SAY", "CHAT_MSG_MONSTER_YELL", "CHAT_MSG_MONSTER_EMOTE",
+    "CHAT_MSG_MONSTER_WHISPER", "CHAT_MSG_MONSTER_PARTY",
 }) do frame:RegisterEvent(ev) end
 frame:SetScript("OnEvent", OnEvent)
 
@@ -500,7 +917,10 @@ local function HandleSlash(input)
     elseif cmd == "options" or cmd == "config" then
         if PetRP.ToggleOptions then PetRP.ToggleOptions() end
     elseif cmd == "interval" and tonumber(rest) then
-        PetRP_Config.interval = math.max(15, tonumber(rest))
+        local newInt = math.max(15, tonumber(rest))
+        PetRP_Config.interval = newInt
+        local cfg = PetRP.GetPetSettings()
+        if cfg then cfg.interval = newInt end
         PetRP.RestartTicker()
     else
         PetRP.Speak()

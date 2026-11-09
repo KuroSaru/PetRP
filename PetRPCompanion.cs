@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -58,6 +58,17 @@ namespace PetRPCompanion
                 GetGlancesSummary(),
                 string.IsNullOrEmpty(CleanAbout) ? "None" : CleanAbout);
         }
+    }
+
+    public sealed class PetMessagePools
+    {
+        public readonly List<string> Reactive = new List<string>();
+        public readonly List<string> Emotes = new List<string>();
+        public readonly List<string> Says = new List<string>();
+        public readonly List<string> DefaultEmotes = new List<string>();
+        public readonly List<string> DefaultSays = new List<string>();
+        public bool DefaultsGenerated = true;
+        public int IntervalSeconds = 180;
     }
 
     public sealed class ModelOption
@@ -123,8 +134,11 @@ namespace PetRPCompanion
         [DllImport("user32.dll")]
         private static extern bool ClientToScreen(IntPtr hWnd, ref Point lpPoint);
 
-        private static bool IsWoWSyncBeaconLit(IntPtr wowHwnd)
+        private const string NO_PET_LABEL = "(No Pet Loaded)";
+
+        private static bool TryReadWoWBeaconPixel(IntPtr wowHwnd, out Color pixelColor)
         {
+            pixelColor = Color.Empty;
             if (wowHwnd == IntPtr.Zero) return false;
             try
             {
@@ -136,11 +150,23 @@ namespace PetRPCompanion
                     {
                         g.CopyFromScreen(pt.X, pt.Y, 0, 0, new Size(1, 1));
                     }
-                    Color c = bmp.GetPixel(0, 0);
-                    return c.R >= 10 && c.R <= 35 && c.G >= 230 && c.B >= 100 && c.B <= 135;
+                    pixelColor = bmp.GetPixel(0, 0);
+                    return true;
                 }
             }
             catch { return false; }
+        }
+
+        private static int ComputePetBeaconByte(string nameStr)
+        {
+            if (string.IsNullOrEmpty(nameStr)) return 0;
+            string s = nameStr.ToLowerInvariant();
+            int sum = 0;
+            for (int i = 0; i < s.Length; i++)
+            {
+                sum = (sum * 31 + ((int)s[i] & 0xFF)) % 231;
+            }
+            return 20 + sum;
         }
 
         private const uint FR_PRIVATE = 0x10;
@@ -284,21 +310,21 @@ namespace PetRPCompanion
 
         private readonly Dictionary<string, CompanionProfile> profiles = new Dictionary<string, CompanionProfile>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, string> savedIconNames = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, string> seenPetsMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> masterNamesSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, string> libRpMediaIcons = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, PetMessagePools> petPoolsMap = new Dictionary<string, PetMessagePools>(StringComparer.OrdinalIgnoreCase);
 
-        private readonly List<string> defaultEmotePool = new List<string>();
-        private readonly List<string> defaultSayPool = new List<string>();
-        private readonly List<string> customReactivePool = new List<string>();
-        private readonly List<string> customEmotePool = new List<string>();
-        private readonly List<string> customSayPool = new List<string>();
         private readonly List<string> pendingSmuggleItems = new List<string>();
         private readonly object poolLock = new object();
 
         private bool isWatching;
         private bool forceSyncHighlight;
-        private bool defaultsGeneratedFlag = true;
         private int currentSyncSeq = 100;
         private int unsyncedStartSeq;
+        private string inGamePetStatus = "Unknown (Waiting for WoW)";
+        private string inGameActivePet = "";
+        private int lastBeaconStateCode = -1;
         private CancellationTokenSource cts;
         private int totalMessages, promptTokens, outputTokens, syncTriggerCount;
         private string lastSyncTriggerText = "None yet";
@@ -310,6 +336,59 @@ namespace PetRPCompanion
         private int configuredProQuota = 500;
         private bool hideAccountBanner;
         private float configuredFontSize = 10.0f;
+
+        private string GetCanonicalPetKey(string rawPetName)
+        {
+            if (string.IsNullOrWhiteSpace(rawPetName)) return "";
+            string trimmed = rawPetName.Trim();
+            if (string.Equals(trimmed, NO_PET_LABEL, StringComparison.OrdinalIgnoreCase))
+                return "";
+            CompanionProfile cp;
+            if (profiles.TryGetValue(trimmed, out cp) && !string.IsNullOrEmpty(cp.BoundName))
+                return cp.BoundName;
+            foreach (KeyValuePair<string, CompanionProfile> kv in profiles)
+            {
+                if (!string.IsNullOrEmpty(kv.Value.RPName) && string.Equals(kv.Value.RPName, trimmed, StringComparison.OrdinalIgnoreCase))
+                    return !string.IsNullOrEmpty(kv.Value.BoundName) ? kv.Value.BoundName : kv.Key;
+            }
+            return trimmed;
+        }
+
+        private PetMessagePools GetPoolsForPetLocked(string rawPetName, bool seedDefaultsIfEmpty = true)
+        {
+            string key = GetCanonicalPetKey(rawPetName);
+            if (string.IsNullOrEmpty(key)) key = "Pachimari";
+
+            PetMessagePools pools;
+            if (!petPoolsMap.TryGetValue(key, out pools))
+            {
+                CompanionProfile cp;
+                if (profiles.TryGetValue(key, out cp) && !string.IsNullOrEmpty(cp.RPName) && petPoolsMap.TryGetValue(cp.RPName, out pools))
+                {
+                    petPoolsMap[key] = pools;
+                }
+                else
+                {
+                    pools = new PetMessagePools();
+                    petPoolsMap[key] = pools;
+                }
+            }
+            if (seedDefaultsIfEmpty)
+            {
+                if (pools.DefaultEmotes.Count == 0) pools.DefaultEmotes.AddRange(DEFAULT_PET_EMOTES);
+                if (pools.DefaultSays.Count == 0) pools.DefaultSays.AddRange(DEFAULT_PET_SAYS);
+            }
+            return pools;
+        }
+
+        private string GetActiveEditingPetKey()
+        {
+            if (cmbPetSelect == null) return "";
+            string txt = (cmbPetSelect.Text ?? "").Trim();
+            if (string.IsNullOrEmpty(txt) || string.Equals(txt, NO_PET_LABEL, StringComparison.OrdinalIgnoreCase))
+                return "";
+            return txt;
+        }
 
         public MainForm()
         {
@@ -332,8 +411,8 @@ namespace PetRPCompanion
             BuildUI();
             ApplyFontAndProportionalScale(configuredFontSize, true);
             LoadLibRPMediaIcons();
-            LoadTRP3Data();
             LoadExistingResponsePools();
+            LoadTRP3Data();
             WriteLuaState();
             UpdateSignalSoundFile();
             StartBackgroundSmuggleListener();
@@ -998,8 +1077,8 @@ namespace PetRPCompanion
             ctrlBar = new TRP3BorderPanel { BackColor = TRP3_PANEL_BG, DrawCornerRivets = false };
             lblPet = MakeLabel("Pet:", TRP3_GOLD);
             cmbPetSelect = new ComboBox { BackColor = TRP3_INSET_BG, ForeColor = TRP3_IVORY, FlatStyle = FlatStyle.Flat };
-            cmbPetSelect.SelectedIndexChanged += (s, e) => UpdatePetCard(cmbPetSelect.Text);
-            cmbPetSelect.TextChanged += (s, e) => UpdatePetCard(cmbPetSelect.Text);
+            cmbPetSelect.SelectedIndexChanged += (s, e) => { UpdatePetCard(cmbPetSelect.Text); RefreshStoredMessagesListUI(); };
+            cmbPetSelect.TextChanged += (s, e) => { UpdatePetCard(cmbPetSelect.Text); RefreshStoredMessagesListUI(); };
 
             lblMod = MakeLabel("Model:", TRP3_GOLD);
             cmbModel = new ComboBox { DropDownStyle = ComboBoxStyle.DropDown, BackColor = TRP3_INSET_BG, ForeColor = TRP3_IVORY, FlatStyle = FlatStyle.Flat };
@@ -1012,6 +1091,14 @@ namespace PetRPCompanion
             {
                 int sec = (int)numInterval.Value;
                 lblIntUnit.Text = string.Format("sec ({0}m {1}s)", sec / 60, sec % 60);
+                string activePet = GetActiveEditingPetKey();
+                if (!string.IsNullOrEmpty(activePet))
+                {
+                    lock (poolLock)
+                    {
+                        GetPoolsForPetLocked(activePet, false).IntervalSeconds = sec;
+                    }
+                }
             };
             string timerTip = "Periodic generation interval in Seconds (e.g., 120 = 2 minutes, 180 = 3 minutes).";
             trpTooltip.SetToolTip(lblInt, timerTip);
@@ -1558,11 +1645,12 @@ namespace PetRPCompanion
                 {
                     if (InstallOrReinstallWoWAddon(false))
                     {
+                        lock (poolLock) { AdvanceSyncSequenceLocked(); }
                         WriteLuaState();
                         UpdateSignalSoundFile();
                         MessageBox.Show(this,
                             "PetRP WoW Addon has been updated to v" + bndVer + "!\r\n\r\n" +
-                            "If World of Warcraft is currently open, type /reload in-game to load the updated addon.",
+                            "If World of Warcraft is currently open, click the Sync button on your PetRP bar (or type /reload) to load the updated addon.",
                             "PetRP Addon Updated",
                             MessageBoxButtons.OK,
                             MessageBoxIcon.Information);
@@ -1800,8 +1888,10 @@ namespace PetRPCompanion
 
         private void LoadTRP3Data()
         {
+            string prevSelected = cmbPetSelect.Text;
             profiles.Clear();
             savedIconNames.Clear();
+            seenPetsMap.Clear();
             cmbPetSelect.Items.Clear();
             string summonedPet = null;
 
@@ -1813,28 +1903,111 @@ namespace PetRPCompanion
                     ParseTotalRP3SavedVarsFile(file, ref summonedPet);
             }
 
-            if (!string.IsNullOrEmpty(summonedPet))
+            List<string> allPets = new List<string>();
+            HashSet<string> added = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string k in profiles.Keys)
+            {
+                if (!string.IsNullOrWhiteSpace(k) && added.Add(k)) allPets.Add(k);
+            }
+            foreach (string k in seenPetsMap.Keys)
+            {
+                if (!string.IsNullOrWhiteSpace(k) && added.Add(k)) allPets.Add(k);
+            }
+            lock (poolLock)
+            {
+                foreach (string k in new List<string>(petPoolsMap.Keys))
+                {
+                    string canon = GetCanonicalPetKey(k);
+                    if (!string.IsNullOrWhiteSpace(canon) && added.Add(canon)) allPets.Add(canon);
+                }
+                foreach (string p in allPets)
+                {
+                    if (profiles.ContainsKey(p))
+                        GetPoolsForPetLocked(p, true);
+                }
+            }
+
+            cmbPetSelect.Items.Add(NO_PET_LABEL);
+            foreach (string p in allPets)
+                cmbPetSelect.Items.Add(p);
+
+            if (!string.IsNullOrEmpty(prevSelected) && cmbPetSelect.Items.Contains(prevSelected))
+                cmbPetSelect.Text = prevSelected;
+            else if (!string.IsNullOrEmpty(summonedPet) && added.Contains(summonedPet))
                 cmbPetSelect.Text = summonedPet;
-            else if (cmbPetSelect.Items.Count > 0 && string.IsNullOrEmpty(cmbPetSelect.Text))
-                cmbPetSelect.SelectedIndex = 0;
+            else if (allPets.Count > 0)
+                cmbPetSelect.Text = allPets[0];
+            else
+                cmbPetSelect.Text = NO_PET_LABEL;
 
             UpdatePetCard(cmbPetSelect.Text);
-            AppendLog("System", "Synced " + profiles.Count + " TRP3 Companion profile(s) from TRP3_Companions.");
+            RefreshStoredMessagesListUI();
+            AppendLog("System", "Synced " + profiles.Count + " TRP3 Companion profile(s) and " + allPets.Count + " total seen pet(s).");
         }
 
         private void LoadSavedIconMap(string wtfRoot)
         {
+            masterNamesSet.Clear();
             foreach (string pFile in Directory.GetFiles(wtfRoot, "PetRP.lua", SearchOption.AllDirectories))
             {
                 string pRaw = File.ReadAllText(pFile, Encoding.UTF8);
+                int masterIdx = pRaw.IndexOf("[\"masterNames\"]");
+                if (masterIdx >= 0)
+                {
+                    string masterTable = ExtractBalancedLuaTable(pRaw, masterIdx);
+                    foreach (Match mm in Regex.Matches(masterTable, "\"([^\"]+)\""))
+                    {
+                        string mn = mm.Groups[1].Value.Trim();
+                        if (mn.Length >= 2 && !string.Equals(mn, "masterNames", StringComparison.OrdinalIgnoreCase))
+                            masterNamesSet.Add(mn);
+                    }
+                }
+                int seenIdx = pRaw.IndexOf("[\"seenPets\"]");
+                if (seenIdx >= 0)
+                {
+                    string seenTable = ExtractBalancedLuaTable(pRaw, seenIdx);
+                    foreach (Match sm in Regex.Matches(seenTable, @"\[\""([^\""]+)\""\]\s*=\s*\""([^\""]*)\"""))
+                        seenPetsMap[sm.Groups[1].Value] = sm.Groups[2].Value;
+                }
+                int settingsIdx = pRaw.IndexOf("[\"petSettings\"]");
+                if (settingsIdx >= 0)
+                {
+                    string settingsTable = ExtractBalancedLuaTable(pRaw, settingsIdx);
+                    foreach (Match pm in Regex.Matches(settingsTable, @"\[\""([^\""]+)\""\]\s*=\s*\{"))
+                    {
+                        string pKey = pm.Groups[1].Value;
+                        string pBlock = ExtractBalancedLuaTable(settingsTable, pm.Index);
+                        Match intMatch = Regex.Match(pBlock, @"\[\""interval\""\]\s*=\s*(\d+)");
+                        int parsedInt;
+                        if (intMatch.Success && int.TryParse(intMatch.Groups[1].Value, out parsedInt) && parsedInt >= 15)
+                        {
+                            lock (poolLock)
+                            {
+                                GetPoolsForPetLocked(pKey, false).IntervalSeconds = Math.Min(3600, parsedInt);
+                            }
+                        }
+                    }
+                }
                 foreach (Match im in Regex.Matches(pRaw, @"\[\""([^\""]+)\""\]\s*=\s*\""([^\""]+)\"""))
-                    savedIconNames[im.Groups[1].Value] = im.Groups[2].Value;
+                {
+                    string k = im.Groups[1].Value;
+                    if (!string.Equals(k, "point", StringComparison.OrdinalIgnoreCase) &&
+                        !string.Equals(k, "relPoint", StringComparison.OrdinalIgnoreCase))
+                    {
+                        savedIconNames[k] = im.Groups[2].Value;
+                    }
+                }
             }
         }
 
         private void ParseTotalRP3SavedVarsFile(string filePath, ref string summonedPet)
         {
             string raw = File.ReadAllText(filePath, Encoding.UTF8);
+            foreach (Match fnm in Regex.Matches(raw, @"\[\""FN\""\]\s*=\s*\""([^\""]+)\"""))
+            {
+                string fn = UnescapeLuaString(fnm.Groups[1].Value).Trim();
+                if (fn.Length >= 2) masterNamesSet.Add(fn);
+            }
             int compIdx = raw.IndexOf("TRP3_Companions");
             if (compIdx < 0) return;
 
@@ -1877,13 +2050,18 @@ namespace PetRPCompanion
                 GlanceSlots = ParseGlanceSlots(peBlock)
             };
 
+            int linkCount = 0;
             foreach (Match lm in Regex.Matches(linksBlock, @"\[\""([^\""]+)\""\]\s*=\s*(?:\""(?:BATTLE_PET|PET)\""|1|2)"))
             {
                 string link = lm.Groups[1].Value;
                 cp.BoundName = link;
                 profiles[link] = cp;
-                if (!cmbPetSelect.Items.Contains(link))
-                    cmbPetSelect.Items.Add(link);
+                linkCount++;
+            }
+            if (linkCount == 0 && !string.IsNullOrWhiteSpace(cp.RPName))
+            {
+                cp.BoundName = cp.RPName;
+                profiles[cp.RPName] = cp;
             }
         }
 
@@ -1905,24 +2083,35 @@ namespace PetRPCompanion
             int portraitSz = Math.Max(32, picPetIcon.Width > 0 ? picPetIcon.Width : ScalePx(54));
             int glanceIconSz = Math.Max(24, glanceIcons[0] != null && glanceIcons[0].Width > 0 ? glanceIcons[0].Width : ScalePx(32));
 
-            if (string.IsNullOrWhiteSpace(petKey))
+            if (string.IsNullOrWhiteSpace(petKey) || string.Equals(petKey.Trim(), NO_PET_LABEL, StringComparison.OrdinalIgnoreCase))
             {
-                lblPetHeadline.ForeColor = TRP3_GOLD;
-                lblPetHeadline.Text = "No Companion Active";
-                lblPetSubtitle.Text = "Select or type your summoned companion's name below";
-                RenderIconBadge(picPetIcon, "🐾", TRP3_GOLD, portraitSz);
-                ClearGlancesAndAbout(glanceIconSz, "No TRP3 Companion Profile loaded.");
+                lblPetHeadline.ForeColor = TRP3_MUTED;
+                lblPetHeadline.Text = "PetRP Disabled — No Pet Loaded";
+                lblPetSubtitle.Text = "Summon a companion in WoW or select any seen companion from the Pet dropdown below";
+                LoadExtractedAboutTextureAsync(picPetIcon, "Interface\\PVPFrame\\Icons\\PVP-Banner-Emblem-40", TRP3_MUTED, portraitSz);
+                ClearGlancesAndAbout(glanceIconSz, "No companion loaded. All in-game PetRP message pools are unloaded while no profiled pet is active.");
                 return;
             }
 
+            string trimmedPet = petKey.Trim();
+            if (numInterval != null)
+            {
+                int petInt = 180;
+                lock (poolLock) { petInt = GetPoolsForPetLocked(trimmedPet, false).IntervalSeconds; }
+                petInt = Math.Max((int)numInterval.Minimum, Math.Min((int)numInterval.Maximum, petInt));
+                if ((int)numInterval.Value != petInt) numInterval.Value = petInt;
+            }
             CompanionProfile cp;
-            if (!profiles.TryGetValue(petKey.Trim(), out cp))
+            if (!profiles.TryGetValue(trimmedPet, out cp))
             {
                 lblPetHeadline.ForeColor = TRP3_GOLD;
-                lblPetHeadline.Text = petKey.Trim() + "  (Unlinked in TRP3)";
-                lblPetSubtitle.Text = "Using standard companion name without TRP3 profile traits";
-                RenderIconBadge(picPetIcon, petKey.Trim(), TRP3_GOLD, portraitSz);
-                ClearGlancesAndAbout(glanceIconSz, "Tip: Link this companion to a Total RP 3 Companion Profile in-game (/trp3 -> Companions) and click 'Sync TRP3'.");
+                lblPetHeadline.Text = trimmedPet + "  (No TRP3 Profile)";
+                lblPetSubtitle.Text = "In-Game: Click the PetRP icon to open TRP3 Companion dialog to make one";
+                string knownIcon = "";
+                if (!seenPetsMap.TryGetValue(trimmedPet, out knownIcon) || string.IsNullOrEmpty(knownIcon))
+                    savedIconNames.TryGetValue(trimmedPet, out knownIcon);
+                LoadIconIntoPictureBox(picPetIcon, trimmedPet, trimmedPet, knownIcon, TRP3_GOLD, portraitSz, "🐾");
+                ClearGlancesAndAbout(glanceIconSz, "This companion does not have a Total RP 3 profile yet.\r\n\r\nIn World of Warcraft, click the PetRP icon when '" + trimmedPet + "' is summoned to open the TRP3 Companion Profiles dialog and create one, then click 'Sync TRP3'.");
                 return;
             }
 
@@ -2645,7 +2834,8 @@ namespace PetRPCompanion
 
         private async Task TriggerManualGenerationAsync()
         {
-            string pet = string.IsNullOrEmpty(cmbPetSelect.Text.Trim()) ? "Companion" : cmbPetSelect.Text.Trim();
+            string pet = GetActiveEditingPetKey();
+            if (string.IsNullOrEmpty(pet)) pet = !string.IsNullOrEmpty(inGameActivePet) ? inGameActivePet : "Pachimari";
             string model = GetSelectedModelId();
             string persona = GetPersonaForPet(pet);
 
@@ -2661,24 +2851,27 @@ namespace PetRPCompanion
 
         private void GenerateSinglePeriodicMessage(string pet, string model, string persona, List<string> ctx)
         {
+            PetMessagePools pools;
+            lock (poolLock) { pools = GetPoolsForPetLocked(pet); }
+
             if (periodicGenCycle == 1)
             {
                 periodicEmoteBuf = QueryAgy("PERIODIC_EMOTE", pet, model, IDLE_EMOTE_PROMPT, persona, ctx);
-                AddUniquePoolEntry(customEmotePool, periodicEmoteBuf);
+                AddUniquePoolEntry(pools.Emotes, periodicEmoteBuf);
                 QueueForSmuggling("EMOTE", periodicEmoteBuf);
                 periodicGenCycle = 2;
             }
             else if (periodicGenCycle == 2)
             {
                 periodicSayBuf = QueryAgy("PERIODIC_SAY", pet, model, IDLE_SAY_PROMPT, persona, ctx);
-                AddUniquePoolEntry(customSayPool, periodicSayBuf);
+                AddUniquePoolEntry(pools.Says, periodicSayBuf);
                 QueueForSmuggling("SAY", periodicSayBuf);
                 periodicGenCycle = 3;
             }
             else
             {
                 periodicEmoteBuf = QueryAgy("PERIODIC_SOUND", pet, model, IDLE_EMOTE_PROMPT, persona, ctx);
-                AddUniquePoolEntry(customEmotePool, periodicEmoteBuf);
+                AddUniquePoolEntry(pools.Emotes, periodicEmoteBuf);
                 QueueForSmuggling("EMOTE", periodicEmoteBuf);
                 periodicGenCycle = 1;
             }
@@ -2686,7 +2879,8 @@ namespace PetRPCompanion
 
         private async Task TriggerTestGenerationAsync()
         {
-            string pet = string.IsNullOrEmpty(cmbPetSelect.Text.Trim()) ? "Companion" : cmbPetSelect.Text.Trim();
+            string pet = GetActiveEditingPetKey();
+            if (string.IsNullOrEmpty(pet)) pet = !string.IsNullOrEmpty(inGameActivePet) ? inGameActivePet : "Pachimari";
             string model = GetSelectedModelId();
             string persona = GetPersonaForPet(pet);
 
@@ -2737,9 +2931,11 @@ namespace PetRPCompanion
             string pet = "";
             string model = "gemini-3.8-flash-low";
             int intervalSec = 180;
+            bool pauseAutoGen = false;
             Invoke((Action)(() =>
             {
-                pet = cmbPetSelect.Text.Trim();
+                pauseAutoGen = (inGamePetStatus == "No Pet Loaded" || inGamePetStatus == "Pet Has No TRP3 Profile");
+                pet = !string.IsNullOrEmpty(inGameActivePet) ? inGameActivePet : GetActiveEditingPetKey();
                 model = GetSelectedModelId();
                 intervalSec = (int)numInterval.Value;
             }));
@@ -2747,10 +2943,10 @@ namespace PetRPCompanion
             string line = await sr.ReadLineAsync();
             if (!string.IsNullOrEmpty(line))
             {
-                ProcessIncomingLogLine(line, pet, model, contextWindow);
+                ProcessIncomingLogLine(line, pauseAutoGen ? "" : pet, model, contextWindow);
                 return lastPeriodic;
             }
-            if (!string.IsNullOrEmpty(pet) && (DateTime.Now - lastPeriodic).TotalSeconds >= intervalSec)
+            if (!pauseAutoGen && !string.IsNullOrEmpty(pet) && profiles.ContainsKey(pet) && (DateTime.Now - lastPeriodic).TotalSeconds >= intervalSec)
             {
                 string persona = GetPersonaForPet(pet);
                 List<string> snapshot = new List<string>(contextWindow);
@@ -2794,6 +2990,34 @@ namespace PetRPCompanion
             }));
         }
 
+        private bool IsLineReactiveTrigger(string cleanedIcLine, string pet)
+        {
+            if (string.IsNullOrEmpty(pet) || !profiles.ContainsKey(pet)) return false;
+            string trimmed = cleanedIcLine.TrimStart();
+            if (trimmed.StartsWith("|| [", StringComparison.OrdinalIgnoreCase) || trimmed.StartsWith("| [", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            if (cleanedIcLine.IndexOf(pet, StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+
+            CompanionProfile cp;
+            if (profiles.TryGetValue(pet, out cp) && !string.IsNullOrEmpty(cp.RPName) &&
+                cleanedIcLine.IndexOf(cp.RPName, StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+
+            // Also trigger when the pet's master (the player) name is said in local (/say) or mentioned by an NPC/monster
+            bool isPartyOrRaid = trimmed.StartsWith("[", StringComparison.OrdinalIgnoreCase);
+            if (!isPartyOrRaid)
+            {
+                foreach (string masterName in masterNamesSet)
+                {
+                    if (!string.IsNullOrEmpty(masterName) && cleanedIcLine.IndexOf(masterName, StringComparison.OrdinalIgnoreCase) >= 0)
+                        return true;
+                }
+            }
+            return false;
+        }
+
         private void ProcessIncomingLogLine(string rawLine, string pet, string model, LinkedList<string> contextWindow)
         {
             string cleanedIcLine;
@@ -2803,10 +3027,12 @@ namespace PetRPCompanion
             while (contextWindow.Count > MAX_IC_CONTEXT_MESSAGES)
                 contextWindow.RemoveFirst();
 
-            if (!string.IsNullOrEmpty(pet) && cleanedIcLine.IndexOf(pet, StringComparison.OrdinalIgnoreCase) >= 0)
+            if (IsLineReactiveTrigger(cleanedIcLine, pet))
             {
                 reactiveBuf = QueryAgy("REACTIVE_EMOTE", pet, model, REACTIVE_PROMPT, GetPersonaForPet(pet), new List<string>(contextWindow));
-                AddUniquePoolEntry(customReactivePool, reactiveBuf);
+                PetMessagePools pools;
+                lock (poolLock) { pools = GetPoolsForPetLocked(pet); }
+                AddUniquePoolEntry(pools.Reactive, reactiveBuf);
                 QueueForSmuggling("REACT", reactiveBuf);
                 WriteLuaState();
                 UpdateSignalSoundFile();
@@ -2910,6 +3136,32 @@ namespace PetRPCompanion
             catch { }
         }
 
+        private string MatchPetByBeaconByte(int bVal)
+        {
+            foreach (KeyValuePair<string, CompanionProfile> kv in profiles)
+            {
+                if (Math.Abs(ComputePetBeaconByte(kv.Key) - bVal) <= 1 ||
+                    (!string.IsNullOrEmpty(kv.Value.RPName) && Math.Abs(ComputePetBeaconByte(kv.Value.RPName) - bVal) <= 1))
+                {
+                    return kv.Key;
+                }
+            }
+            foreach (string seen in seenPetsMap.Keys)
+            {
+                if (Math.Abs(ComputePetBeaconByte(seen) - bVal) <= 1)
+                    return seen;
+            }
+            lock (poolLock)
+            {
+                foreach (string k in petPoolsMap.Keys)
+                {
+                    if (Math.Abs(ComputePetBeaconByte(k) - bVal) <= 1)
+                        return k;
+                }
+            }
+            return "";
+        }
+
         private void StartBackgroundSmuggleListener()
         {
             System.Windows.Forms.Timer clipTimer = new System.Windows.Forms.Timer { Interval = 200 };
@@ -2918,9 +3170,49 @@ namespace PetRPCompanion
                 try
                 {
                     IntPtr wowHwnd = FindRunningWoWWindow();
-                    if (wowHwnd != IntPtr.Zero && IsWoWSyncBeaconLit(wowHwnd))
+                    Color c;
+                    if (wowHwnd == IntPtr.Zero || !TryReadWoWBeaconPixel(wowHwnd, out c))
+                        return;
+
+                    // 1. UI Reload Flash: RGB(20, 247, 116)
+                    if (c.R >= 10 && c.R <= 35 && c.G >= 230 && c.B >= 100 && c.B <= 135)
                     {
                         HandleWoWReloadDetected();
+                        return;
+                    }
+
+                    // 2. Live Addon Pet State Beacon: RGB(21, 42, B)
+                    if (c.R >= 15 && c.R <= 27 && c.G >= 36 && c.G <= 48)
+                    {
+                        int stateCode;
+                        string newStatus;
+                        string newActivePet = "";
+                        if (c.B <= 4)
+                        {
+                            stateCode = 0;
+                            newStatus = "No Pet Loaded";
+                        }
+                        else if (c.B >= 6 && c.B <= 15)
+                        {
+                            stateCode = 10;
+                            newStatus = "Pet Has No TRP3 Profile";
+                        }
+                        else
+                        {
+                            string matched = MatchPetByBeaconByte(c.B);
+                            stateCode = 20 + c.B;
+                            newActivePet = matched;
+                            newStatus = !string.IsNullOrEmpty(matched) ? ("Active (" + matched + ")") : "Active Companion";
+                        }
+
+                        if (stateCode != lastBeaconStateCode)
+                        {
+                            lastBeaconStateCode = stateCode;
+                            inGamePetStatus = newStatus;
+                            inGameActivePet = newActivePet;
+                            UpdateStatsBar(isWatching ? "Watching" : "Idle");
+                            AppendLog("WoW State", "In-game companion state reported by PetRP addon: " + newStatus);
+                        }
                     }
                 }
                 catch { }
@@ -2956,13 +3248,13 @@ namespace PetRPCompanion
         // 9. STORED MESSAGES EDITOR TAB & 60-DEFAULTS REGENERATOR
         // =====================================================================
 
-        private List<string> GetPoolByKindTag(string kindTag)
+        private List<string> GetPoolByKindTag(PetMessagePools pools, string kindTag)
         {
-            if (string.Equals(kindTag, "REACT", StringComparison.OrdinalIgnoreCase)) return customReactivePool;
-            if (string.Equals(kindTag, "SAY", StringComparison.OrdinalIgnoreCase)) return customSayPool;
-            if (string.Equals(kindTag, "DEFEMOTE", StringComparison.OrdinalIgnoreCase)) return defaultEmotePool;
-            if (string.Equals(kindTag, "DEFSAY", StringComparison.OrdinalIgnoreCase)) return defaultSayPool;
-            return customEmotePool;
+            if (string.Equals(kindTag, "REACT", StringComparison.OrdinalIgnoreCase)) return pools.Reactive;
+            if (string.Equals(kindTag, "SAY", StringComparison.OrdinalIgnoreCase)) return pools.Says;
+            if (string.Equals(kindTag, "DEFEMOTE", StringComparison.OrdinalIgnoreCase)) return pools.DefaultEmotes;
+            if (string.Equals(kindTag, "DEFSAY", StringComparison.OrdinalIgnoreCase)) return pools.DefaultSays;
+            return pools.Emotes;
         }
 
         private string GetSelectedEditorKindTag()
@@ -2974,21 +3266,31 @@ namespace PetRPCompanion
         private void RefreshStoredMessagesListUI()
         {
             if (lstStoredMessages == null || lblDefaultsStatus == null) return;
+            string activePet = GetActiveEditingPetKey();
+            if (string.IsNullOrEmpty(activePet))
+            {
+                lblDefaultsStatus.ForeColor = TRP3_MUTED;
+                lblDefaultsStatus.Text = "No Pet Selected — Select a seen companion in the 'Pet:' dropdown to view or edit its stored messages.";
+                lstStoredMessages.Items.Clear();
+                return;
+            }
+
             lock (poolLock)
             {
-                int defCount = defaultEmotePool.Count + defaultSayPool.Count;
-                int totalEmotes = defaultEmotePool.Count + customEmotePool.Count;
-                int totalSays = defaultSayPool.Count + customSayPool.Count;
-                int totalAll = totalEmotes + totalSays + customReactivePool.Count;
-                string defState = defaultsGeneratedFlag ? ("✔ Generated (" + defCount + ")") : "⚠ Custom Only";
+                PetMessagePools pools = GetPoolsForPetLocked(activePet, profiles.ContainsKey(activePet));
+                int defCount = pools.DefaultEmotes.Count + pools.DefaultSays.Count;
+                int totalEmotes = pools.DefaultEmotes.Count + pools.Emotes.Count;
+                int totalSays = pools.DefaultSays.Count + pools.Says.Count;
+                int totalAll = totalEmotes + totalSays + pools.Reactive.Count;
+                string defState = defCount > 0 ? ("✔ Generated (" + defCount + ")") : "⚠ Custom Only";
                 string syncState = (forceSyncHighlight || pendingSmuggleItems.Count >= SMUGGLE_SIGNAL_THRESHOLD)
                     ? "  |  ⚡ In-Game Sync Highlighted!"
-                    : (pendingSmuggleItems.Count > 0 ? string.Format("  |  Queued: {0}/10", pendingSmuggleItems.Count) : "");
+                    : "";
 
                 lblDefaultsStatus.ForeColor = (forceSyncHighlight || pendingSmuggleItems.Count >= SMUGGLE_SIGNAL_THRESHOLD) ? TRP3_GOLD : TRP3_GREEN;
                 lblDefaultsStatus.Text = string.Format(
-                    "Defaults: {0}  |  Total Stored: {1} (Emotes: {2}, Says: {3}, Reactive: {4}){5}",
-                    defState, totalAll, totalEmotes, totalSays, customReactivePool.Count, syncState);
+                    "[{0}] Defaults: {1}  |  Total Stored: {2} (Emotes: {3}, Says: {4}, Reactive: {5}){6}",
+                    activePet, defState, totalAll, totalEmotes, totalSays, pools.Reactive.Count, syncState);
 
                 string filter = cmbMsgFilter.SelectedItem != null ? cmbMsgFilter.SelectedItem.ToString() : "All";
                 int prevIdx = lstStoredMessages.SelectedIndex;
@@ -2996,15 +3298,15 @@ namespace PetRPCompanion
                 lstStoredMessages.Items.Clear();
 
                 if (filter.StartsWith("All") || filter.Contains("(REACT)"))
-                    foreach (string s in customReactivePool) lstStoredMessages.Items.Add("[REACT] " + s);
+                    foreach (string s in pools.Reactive) lstStoredMessages.Items.Add("[REACT] " + s);
                 if (filter.StartsWith("All") || filter.Contains("(EMOTE)"))
-                    foreach (string s in customEmotePool) lstStoredMessages.Items.Add("[EMOTE] " + s);
+                    foreach (string s in pools.Emotes) lstStoredMessages.Items.Add("[EMOTE] " + s);
                 if (filter.StartsWith("All") || filter.Contains("(SAY)"))
-                    foreach (string s in customSayPool) lstStoredMessages.Items.Add("[SAY] " + s);
+                    foreach (string s in pools.Says) lstStoredMessages.Items.Add("[SAY] " + s);
                 if (filter.StartsWith("All") || filter.Contains("(DEFEMOTE)"))
-                    foreach (string s in defaultEmotePool) lstStoredMessages.Items.Add("[DEFEMOTE] " + s);
+                    foreach (string s in pools.DefaultEmotes) lstStoredMessages.Items.Add("[DEFEMOTE] " + s);
                 if (filter.StartsWith("All") || filter.Contains("(DEFSAY)"))
-                    foreach (string s in defaultSayPool) lstStoredMessages.Items.Add("[DEFSAY] " + s);
+                    foreach (string s in pools.DefaultSays) lstStoredMessages.Items.Add("[DEFSAY] " + s);
 
                 if (prevIdx >= 0 && prevIdx < lstStoredMessages.Items.Count)
                     lstStoredMessages.SelectedIndex = prevIdx;
@@ -3032,13 +3334,16 @@ namespace PetRPCompanion
 
         private void AddUserMessageFromEditor()
         {
+            string activePet = GetActiveEditingPetKey();
+            if (string.IsNullOrEmpty(activePet)) return;
             string msg = SanitizeForSmuggle(txtEditMessage.Text);
             if (string.IsNullOrEmpty(msg)) return;
             string kind = GetSelectedEditorKindTag();
 
             lock (poolLock)
             {
-                List<string> pool = GetPoolByKindTag(kind);
+                PetMessagePools pools = GetPoolsForPetLocked(activePet, profiles.ContainsKey(activePet));
+                List<string> pool = GetPoolByKindTag(pools, kind);
                 if (!pool.Contains(msg)) pool.Add(msg);
                 pendingSmuggleItems.Add(kind + ":" + msg);
                 AdvanceSyncSequenceLocked();
@@ -3046,12 +3351,13 @@ namespace PetRPCompanion
             WriteLuaState();
             UpdateSignalSoundFile();
             RefreshStoredMessagesListUI();
-            AppendLog("Messages", "Added [" + kind + "] message & highlighted in-game Sync icon: " + msg);
+            AppendLog("Messages", "[" + activePet + "] Added [" + kind + "] message & highlighted in-game Sync icon: " + msg);
         }
 
         private void EditSelectedUserMessage()
         {
-            if (lstStoredMessages.SelectedItem == null) return;
+            string activePet = GetActiveEditingPetKey();
+            if (string.IsNullOrEmpty(activePet) || lstStoredMessages.SelectedItem == null) return;
             Match m = Regex.Match(lstStoredMessages.SelectedItem.ToString(), @"^\[([A-Z]+)\]\s*(.*)$");
             if (!m.Success) return;
 
@@ -3062,7 +3368,8 @@ namespace PetRPCompanion
 
             lock (poolLock)
             {
-                List<string> pool = GetPoolByKindTag(oldKind);
+                PetMessagePools pools = GetPoolsForPetLocked(activePet, profiles.ContainsKey(activePet));
+                List<string> pool = GetPoolByKindTag(pools, oldKind);
                 int idx = pool.IndexOf(oldText);
                 if (idx >= 0) pool[idx] = newText;
                 pendingSmuggleItems.Add("EDT:" + oldKind + ":" + SanitizeForSmuggle(oldText) + "=>" + newText);
@@ -3071,12 +3378,13 @@ namespace PetRPCompanion
             WriteLuaState();
             UpdateSignalSoundFile();
             RefreshStoredMessagesListUI();
-            AppendLog("Messages", "Edited [" + oldKind + "] message & highlighted in-game Sync icon.");
+            AppendLog("Messages", "[" + activePet + "] Edited [" + oldKind + "] message & highlighted in-game Sync icon.");
         }
 
         private void DeleteSelectedUserMessage()
         {
-            if (lstStoredMessages.SelectedItem == null) return;
+            string activePet = GetActiveEditingPetKey();
+            if (string.IsNullOrEmpty(activePet) || lstStoredMessages.SelectedItem == null) return;
             Match m = Regex.Match(lstStoredMessages.SelectedItem.ToString(), @"^\[([A-Z]+)\]\s*(.*)$");
             if (!m.Success) return;
 
@@ -3084,7 +3392,8 @@ namespace PetRPCompanion
             string oldText = m.Groups[2].Value;
             lock (poolLock)
             {
-                List<string> pool = GetPoolByKindTag(kind);
+                PetMessagePools pools = GetPoolsForPetLocked(activePet, profiles.ContainsKey(activePet));
+                List<string> pool = GetPoolByKindTag(pools, kind);
                 pool.Remove(oldText);
                 pendingSmuggleItems.Add("DEL:" + kind + ":" + SanitizeForSmuggle(oldText));
                 AdvanceSyncSequenceLocked();
@@ -3093,18 +3402,23 @@ namespace PetRPCompanion
             WriteLuaState();
             UpdateSignalSoundFile();
             RefreshStoredMessagesListUI();
-            AppendLog("Messages", "Deleted [" + kind + "] message & highlighted in-game Sync icon.");
+            AppendLog("Messages", "[" + activePet + "] Deleted [" + kind + "] message & highlighted in-game Sync icon.");
         }
 
         private async Task ConfirmAndRegenerate60DefaultsAsync()
         {
-            string pet = string.IsNullOrEmpty(cmbPetSelect.Text.Trim()) ? "Companion" : cmbPetSelect.Text.Trim();
+            string pet = GetActiveEditingPetKey();
+            if (string.IsNullOrEmpty(pet))
+            {
+                MessageBox.Show(this, "Please select a companion from the 'Pet:' dropdown first.", "No Companion Selected", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
             DialogResult dr = MessageBox.Show(this,
                 "Regenerate the 60 default messages for '" + pet + "'?\r\n\r\n" +
-                "⚠ IMPORTANT: Any previous Watching messages or manual edits will be LOST in the process, " +
-                "and ALL stored messages will be replaced with 60 newly generated messages.\r\n\r\n" +
+                "⚠ IMPORTANT: Any previous Watching messages or manual edits for '" + pet + "' will be LOST in the process, " +
+                "and ALL stored messages for this pet will be replaced with 60 newly generated messages.\r\n\r\n" +
                 "When finished, the in-game Sync icon above your pet will highlight so you can click it to reload UI and load the new defaults.\r\n\r\n" +
-                "Do you want to replace all stored messages now?",
+                "Do you want to replace all stored messages for '" + pet + "' now?",
                 "Regenerate 60 Default Messages",
                 MessageBoxButtons.YesNo,
                 MessageBoxIcon.Warning);
@@ -3121,19 +3435,19 @@ namespace PetRPCompanion
 
                 lock (poolLock)
                 {
-                    customReactivePool.Clear();
-                    customEmotePool.Clear();
-                    customSayPool.Clear();
-                    defaultEmotePool.Clear();
-                    defaultSayPool.Clear();
-                    defaultEmotePool.AddRange(newEmotes);
-                    defaultSayPool.AddRange(newSays);
+                    PetMessagePools pools = GetPoolsForPetLocked(pet, false);
+                    pools.Reactive.Clear();
+                    pools.Emotes.Clear();
+                    pools.Says.Clear();
+                    pools.DefaultEmotes.Clear();
+                    pools.DefaultSays.Clear();
+                    pools.DefaultEmotes.AddRange(newEmotes);
+                    pools.DefaultSays.AddRange(newSays);
 
                     pendingSmuggleItems.Clear();
                     pendingSmuggleItems.Add("CLR:ALL");
-                    foreach (string e in defaultEmotePool) pendingSmuggleItems.Add("DEFEMOTE:" + SanitizeForSmuggle(e));
-                    foreach (string s in defaultSayPool) pendingSmuggleItems.Add("DEFSAY:" + SanitizeForSmuggle(s));
-                    defaultsGeneratedFlag = true;
+                    foreach (string e in pools.DefaultEmotes) pendingSmuggleItems.Add("DEFEMOTE:" + SanitizeForSmuggle(e));
+                    foreach (string s in pools.DefaultSays) pendingSmuggleItems.Add("DEFSAY:" + SanitizeForSmuggle(s));
                     AdvanceSyncSequenceLocked();
                 }
 
@@ -3241,24 +3555,61 @@ namespace PetRPCompanion
                     int parsedSeq;
                     if (mSeq.Success && int.TryParse(mSeq.Groups[1].Value, out parsedSeq))
                         currentSyncSeq = Math.Max(100, parsedSeq);
-                    ParseLuaTableEntries(raw, "PetRP_ReactivePool", customReactivePool);
-                    ParseLuaTableEntries(raw, "PetRP_EmotePool", customEmotePool);
-                    ParseLuaTableEntries(raw, "PetRP_SayPool", customSayPool);
-                    ParseLuaTableEntries(raw, "PetRP_DefaultEmotes", defaultEmotePool);
-                    ParseLuaTableEntries(raw, "PetRP_DefaultSays", defaultSayPool);
+
+                    int petPoolsIdx = raw.IndexOf("PetRP_PetPools");
+                    if (petPoolsIdx >= 0)
+                    {
+                        string petPoolsTable = ExtractBalancedLuaTable(raw, petPoolsIdx);
+                        foreach (Match pm in Regex.Matches(petPoolsTable, @"\[\""([^\""]+)\""\]\s*=\s*\{"))
+                        {
+                            string petKey = pm.Groups[1].Value;
+                            if (string.Equals(petKey, "reactive", StringComparison.OrdinalIgnoreCase) ||
+                                string.Equals(petKey, "emotes", StringComparison.OrdinalIgnoreCase) ||
+                                string.Equals(petKey, "says", StringComparison.OrdinalIgnoreCase) ||
+                                string.Equals(petKey, "defEmotes", StringComparison.OrdinalIgnoreCase) ||
+                                string.Equals(petKey, "defSays", StringComparison.OrdinalIgnoreCase))
+                                continue;
+
+                            string petBlock = ExtractBalancedLuaTable(petPoolsTable, pm.Index);
+                            lock (poolLock)
+                            {
+                                PetMessagePools pools = GetPoolsForPetLocked(petKey, false);
+                                ParseLuaSubtableEntries(petBlock, "reactive", pools.Reactive);
+                                ParseLuaSubtableEntries(petBlock, "emotes", pools.Emotes);
+                                ParseLuaSubtableEntries(petBlock, "says", pools.Says);
+                                ParseLuaSubtableEntries(petBlock, "defEmotes", pools.DefaultEmotes);
+                                ParseLuaSubtableEntries(petBlock, "defSays", pools.DefaultSays);
+                            }
+                        }
+                    }
+
+                    // Also migrate any legacy flat tables into Pachimari if present
+                    lock (poolLock)
+                    {
+                        PetMessagePools legacyPools = GetPoolsForPetLocked("Pachimari", false);
+                        ParseLuaTableEntries(raw, "PetRP_ReactivePool", legacyPools.Reactive);
+                        ParseLuaTableEntries(raw, "PetRP_EmotePool", legacyPools.Emotes);
+                        ParseLuaTableEntries(raw, "PetRP_SayPool", legacyPools.Says);
+                        ParseLuaTableEntries(raw, "PetRP_DefaultEmotes", legacyPools.DefaultEmotes);
+                        ParseLuaTableEntries(raw, "PetRP_DefaultSays", legacyPools.DefaultSays);
+                    }
                 }
                 catch { }
             }
 
             lock (poolLock)
             {
-                if (defaultEmotePool.Count == 0)
-                    defaultEmotePool.AddRange(DEFAULT_PET_EMOTES);
-                if (defaultSayPool.Count == 0)
-                    defaultSayPool.AddRange(DEFAULT_PET_SAYS);
-                defaultsGeneratedFlag = (defaultEmotePool.Count + defaultSayPool.Count) > 0;
+                GetPoolsForPetLocked("Pachimari", true);
             }
             RefreshStoredMessagesListUI();
+        }
+
+        private void ParseLuaSubtableEntries(string petBlock, string fieldName, List<string> targetPool)
+        {
+            Match m = Regex.Match(petBlock, @"(?:\[\""" + fieldName + @"\""\]|" + fieldName + @")\s*=\s*\{(.*?)\}", RegexOptions.Singleline);
+            if (!m.Success) return;
+            foreach (Match item in Regex.Matches(m.Groups[1].Value, "\"([^\"]+)\""))
+                AddUniquePoolEntry(targetPool, item.Groups[1].Value);
         }
 
         private void ParseLuaTableEntries(string rawLua, string tableName, List<string> targetPool)
@@ -3269,18 +3620,16 @@ namespace PetRPCompanion
                 AddUniquePoolEntry(targetPool, item.Groups[1].Value);
         }
 
-        private static string FormatLuaStringTable(string tableName, IEnumerable<string> items)
+        private static void AppendLuaSubtable(StringBuilder sb, string key, List<string> items)
         {
-            StringBuilder sb = new StringBuilder();
-            sb.Append(tableName).AppendLine(" = {");
+            sb.Append("        [\"").Append(key).AppendLine("\"] = {");
             foreach (string item in items)
             {
                 if (string.IsNullOrWhiteSpace(item)) continue;
                 string safe = SanitizeForSmuggle(item);
-                sb.Append("    \"").Append(safe).AppendLine("\",");
+                sb.Append("            \"").Append(safe).AppendLine("\",");
             }
-            sb.AppendLine("}");
-            return sb.ToString();
+            sb.AppendLine("        },");
         }
 
         private void WriteLuaState()
@@ -3290,22 +3639,43 @@ namespace PetRPCompanion
                 string lua;
                 lock (poolLock)
                 {
-                    string fallbackEmote = defaultEmotePool.Count > 0 ? defaultEmotePool[0] : DEFAULT_PET_EMOTES[0];
-                    string fallbackSay = defaultSayPool.Count > 0 ? defaultSayPool[0] : DEFAULT_PET_SAYS[0];
-                    string nextReact = !string.IsNullOrEmpty(reactiveBuf) ? reactiveBuf : (customReactivePool.Count > 0 ? customReactivePool[customReactivePool.Count - 1] : fallbackEmote);
-                    string nextEmote = !string.IsNullOrEmpty(periodicEmoteBuf) ? periodicEmoteBuf : (customEmotePool.Count > 0 ? customEmotePool[customEmotePool.Count - 1] : fallbackEmote);
-                    string nextSay = !string.IsNullOrEmpty(periodicSayBuf) ? periodicSayBuf : (customSayPool.Count > 0 ? customSayPool[customSayPool.Count - 1] : fallbackSay);
-
                     StringBuilder sb = new StringBuilder();
-                    sb.AppendFormat("PetRP_SyncSeq = {0}\n", currentSyncSeq);
-                    sb.AppendFormat("PetRP_NextMessage = \"{0}\"\n", nextReact);
-                    sb.AppendFormat("PetRP_PeriodicMessage = \"{0}\"\n", nextEmote);
-                    sb.AppendFormat("PetRP_PeriodicSay = \"{0}\"\n\n", nextSay);
-                    sb.AppendLine(FormatLuaStringTable("PetRP_ReactivePool", customReactivePool));
-                    sb.AppendLine(FormatLuaStringTable("PetRP_EmotePool", customEmotePool));
-                    sb.AppendLine(FormatLuaStringTable("PetRP_SayPool", customSayPool));
-                    sb.AppendLine(FormatLuaStringTable("PetRP_DefaultEmotes", defaultEmotePool));
-                    sb.Append(FormatLuaStringTable("PetRP_DefaultSays", defaultSayPool));
+                    sb.AppendFormat("PetRP_SyncSeq = {0}\n\n", currentSyncSeq);
+                    sb.AppendLine("PetRP_PetPools = {");
+
+                    HashSet<string> writtenKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (KeyValuePair<string, PetMessagePools> kv in petPoolsMap)
+                    {
+                        string lowerKey = kv.Key.Trim().ToLowerInvariant();
+                        if (string.IsNullOrEmpty(lowerKey) || !writtenKeys.Add(lowerKey))
+                            continue;
+
+                        sb.Append("    [\"").Append(SanitizeForSmuggle(lowerKey)).AppendLine("\"] = {");
+                        AppendLuaSubtable(sb, "reactive", kv.Value.Reactive);
+                        AppendLuaSubtable(sb, "emotes", kv.Value.Emotes);
+                        AppendLuaSubtable(sb, "says", kv.Value.Says);
+                        AppendLuaSubtable(sb, "defEmotes", kv.Value.DefaultEmotes);
+                        AppendLuaSubtable(sb, "defSays", kv.Value.DefaultSays);
+                        sb.AppendLine("    },");
+
+                        CompanionProfile cp;
+                        if (profiles.TryGetValue(kv.Key, out cp) && !string.IsNullOrEmpty(cp.RPName))
+                        {
+                            string rpLower = cp.RPName.Trim().ToLowerInvariant();
+                            if (!string.IsNullOrEmpty(rpLower) && writtenKeys.Add(rpLower))
+                            {
+                                sb.Append("    [\"").Append(SanitizeForSmuggle(rpLower)).AppendLine("\"] = {");
+                                AppendLuaSubtable(sb, "reactive", kv.Value.Reactive);
+                                AppendLuaSubtable(sb, "emotes", kv.Value.Emotes);
+                                AppendLuaSubtable(sb, "says", kv.Value.Says);
+                                AppendLuaSubtable(sb, "defEmotes", kv.Value.DefaultEmotes);
+                                AppendLuaSubtable(sb, "defSays", kv.Value.DefaultSays);
+                                sb.AppendLine("    },");
+                            }
+                        }
+                    }
+
+                    sb.AppendLine("}");
                     lua = sb.ToString();
                 }
 
@@ -3357,8 +3727,8 @@ namespace PetRPCompanion
         private void UpdateStatsBar(string status)
         {
             lblStats.Text = string.Format(
-                "Status: {0}  |  Sync Triggers: {1} (Last: {2})  |  Msgs: {3}  |  Total Tok: ~{4}",
-                status, syncTriggerCount, lastSyncTriggerText, totalMessages, promptTokens + outputTokens);
+                "Status: {0}  |  WoW Pet: {1}  |  Syncs: {2} ({3})  |  Msgs: {4}  |  Tok: ~{5}",
+                status, inGamePetStatus, syncTriggerCount, lastSyncTriggerText, totalMessages, promptTokens + outputTokens);
         }
 
         private void AppendLog(string tag, string message)

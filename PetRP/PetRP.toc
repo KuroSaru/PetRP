@@ -1,0 +1,11 @@
+﻿## Interface: 120105, 110002, 16001
+## Title: PetRP
+## Notes: Minimal LLM-powered companion pet roleplay bridge with Total RP 3 integration.
+## Author: PetRP
+## Version: 0.8.2
+## OptionalDeps: totalRP3
+## SavedVariablesPerCharacter: PetRP_Config
+
+response.lua
+core.lua
+ui.lua
